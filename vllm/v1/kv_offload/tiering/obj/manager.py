@@ -31,7 +31,10 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
-from vllm.v1.kv_offload.tiering.obj.config import ObjStoreConfig
+from vllm.v1.kv_offload.tiering.obj.config import (
+    AzureBlobStoreConfig,
+    ObjStoreConfig,
+)
 
 if TYPE_CHECKING:
     from nixl._api import nixl_prepped_dlist_handle, nixl_xfer_handle
@@ -56,6 +59,12 @@ _PROBE_ADDR: int = 0
 _PROBE_LEN: int = 1
 _PROBE_DEV_ID: int = 0
 _CUOBJ_MAX_MEMORY_REG_SIZE_BYTES = 4 * 1024 * 1024 * 1024 - 64 * 1024
+
+# NIXL storage backend name -> its store_config schema.
+_STORE_CONFIGS: dict[str, type[ObjStoreConfig] | type[AzureBlobStoreConfig]] = {
+    "OBJ": ObjStoreConfig,
+    "AZURE_BLOB": AzureBlobStoreConfig,
+}
 
 
 class TransferEntry(NamedTuple):
@@ -117,14 +126,16 @@ class ObjAsyncLookupManager(AsyncLookupManager):
             )
             for k in keys
         ]
-        results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
+        results = self._tier._agent.query_memory(
+            descriptors, self._tier._backend, "OBJ"
+        )
         return (r is not None for r in results)
 
 
 class ObjectStoreSecondaryTierManager(SecondaryTierManager):
-    """Secondary tier that offloads KV cache blocks to an S3-compatible store.
+    """Secondary tier for S3-compatible or Azure Blob storage.
 
-    Handles CPU DRAM <-> S3 transfers only. GPU <-> CPU is managed by the
+    Handles CPU DRAM <-> object storage transfers. GPU <-> CPU is managed by the
     primary tier. Object keys are formed as `{prefix}/{hash_shard}/{hash}.bin`.
     """
 
@@ -142,12 +153,13 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         locality: str | None = None,
         backpressure_detector: BackpressureDetector | None = None,
         access_mode: OffloadAccessMode | str = OffloadAccessMode.READWRITE,
+        backend: str = "OBJ",
     ):
         """Args:
         offloading_spec: Offloading configuration.
         primary_kv_view: Memoryview of the primary tier's CPU KV cache.
         tier_type: Tier type identifier, set by SecondaryTierFactory.
-        store_config: Object store connection parameters (see ObjStoreConfig).
+        store_config: Connection parameters for the selected backend.
         prefix: Key prefix prepended to all object keys.
         io_threads: Number of NIXL I/O threads.
         enable_kv_events: Emit BlockStored KV events for blocks
@@ -159,6 +171,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         access_mode: `read` serves loads but never writes blocks, `write`
             writes blocks but never serves loads, and `readwrite` (default)
             does both.
+        backend: NIXL storage backend, either OBJ or AZURE_BLOB.
 
         """
         super().__init__(
@@ -169,6 +182,12 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             access_mode=access_mode,
         )
         self.locality = Locality(locality) if locality is not None else None
+        if backend not in _STORE_CONFIGS:
+            raise ValueError(
+                f"Unsupported object store backend {backend!r}; "
+                f"expected one of {sorted(_STORE_CONFIGS)}"
+            )
+        self._backend = backend
 
         self.events: list[OffloadingEvent] | None = None
         if enable_kv_events:
@@ -189,9 +208,9 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
 
         agent_config = nixl_agent_config(backends=[], capture_telemetry=True)
         self._agent = nixl_agent("ObjAgent", agent_config)
-        obj_config = ObjStoreConfig(**store_config)
+        obj_config = _STORE_CONFIGS[backend](**store_config)
         params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
-        self._agent.create_backend("OBJ", params)
+        self._agent.create_backend(backend, params)
         self._transfers: dict[int, TransferEntry] = {}
         # Buffered results awaiting the next get_finished_jobs() call:
         # submission-time failures + poll-time completions accumulated
@@ -246,6 +265,14 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             self._exists(probe_key)
             logger.info("Object store tier connectivity probe succeeded")
         except Exception as e:
+            if self._backend == "AZURE_BLOB":
+                raise RuntimeError(
+                    f"Object store tier connectivity probe failed — check "
+                    f"container_name, and account_url or connection_string. If "
+                    f"using connection_string verify that it is valid; otherwise "
+                    f"ensure the Azure default credential chain is configured "
+                    f"(managed identity, env vars, Azure CLI). Error: {e}"
+                ) from e
             raise RuntimeError(
                 f"Object store tier connectivity probe failed — check bucket, "
                 f"endpoint_override, and scheme. If using explicit credentials "
@@ -256,7 +283,9 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
 
     def _exists(self, obj_key: str) -> bool:
         results = self._agent.query_memory(
-            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], "OBJ", "OBJ"
+            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)],
+            self._backend,
+            "OBJ",
         )
         return results[0] is not None
 
