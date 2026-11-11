@@ -271,20 +271,45 @@ The exception is the non-cryptographic `xxhash` and `xxhash_cbor` values of `--p
 PYTHONHASHSEED=<shared-value> vllm serve ...
 ```
 
-### Object Store (OBJ)
+### Object Storage
 
-The object-store tier (`type: "obj"`) offloads blocks to an S3-compatible object store through the NIXL OBJ backend.
+Set `type: "obj"` to use the object-storage tier. The `backend` field selects the NIXL storage backend: `OBJ` (the default) for S3-compatible storage or `AZURE_BLOB` for Azure Blob Storage.
 
 | Key | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `type` | yes | — | Must be `obj`. |
+| `backend` | no | `"OBJ"` | NIXL backend: `OBJ` for S3-compatible storage or `AZURE_BLOB` for Azure Blob Storage. |
 | `store_config` | yes | — | Object store connection parameters (see below). |
 | `prefix` | no | `""` | Key prefix prepended to all object keys. |
-| `io_threads` | no | `4` | Number of NIXL OBJ backend I/O threads. |
+| `io_threads` | no | `4` | Number of storage backend I/O threads. |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `STORAGE`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
 
-`store_config` fields:
+Object keys use the same run-configuration digest scheme as the filesystem tier (see [On-Disk Layout](#on-disk-layout)), under the optional `prefix`. The [Cross-Process Sharing](#cross-process-sharing) behavior also applies to instances sharing a bucket or container.
+
+#### Object Storage Flow
+
+The same flow is used for both backends:
+
+1. The tier validates `store_config`, creates the selected NIXL backend, and
+   probes a synthetic object key. An error reported by the probe stops startup;
+   a missing result does not guarantee that the bucket or container exists.
+   The tier then registers the CPU primary-tier memory with NIXL.
+2. The tier maps each KV chunk key to an object key. Lookups are batched at
+   the end of a scheduling step and checked asynchronously through the
+   selected backend.
+3. Store and load jobs transfer chunks between CPU memory and object storage
+   through NIXL. The backend is `OBJ` or `AZURE_BLOB`, while the NIXL object
+   descriptor memory type is `OBJ` for both. GPU transfers are handled
+   separately by the primary tier.
+4. The tier polls for completion, releases transfer resources, and reports
+   job results. Successful stores emit KV events when enabled; failed loads
+   mark their cached lookup verdicts as misses.
+
+#### S3-Compatible Storage
+
+The `OBJ` backend is the default, so existing configurations do not need to
+specify it. Its `store_config` fields are:
 
 | Key | Required | Default | Notes |
 | --- | --- | --- | --- |
@@ -295,7 +320,35 @@ The object-store tier (`type: "obj"`) offloads blocks to an S3-compatible object
 | `region` | no | `""` | Bucket region, if the endpoint requires one. |
 | `ca_bundle` | no | `""` | CA bundle path for TLS verification. |
 
-Object keys follow the same run-configuration digest scheme as the filesystem tier (see [On-Disk Layout](#on-disk-layout)) and are stored under the optional `prefix`. The [Cross-Process Sharing](#cross-process-sharing) behavior applies to shared buckets as well, so instances sharing a bucket produce identical keys for identical content; set a shared `PYTHONHASHSEED` if you want a custom seed. At startup the tier probes object store connectivity and fails fast with a configuration error if the bucket is unreachable.
+#### Azure Blob Storage
+
+Set `backend: "AZURE_BLOB"`. The NIXL installation must include the
+`AZURE_BLOB` plugin. Its `store_config` fields are:
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `container_name` | yes | — | Existing Azure Storage container. |
+| `account_url` | conditional | `""` | Account URL, e.g. `https://<account>.blob.core.windows.net`. Required unless `connection_string` is supplied. |
+| `connection_string` | conditional | `""` | Alternative connection configuration, primarily for local Azurite testing. Takes precedence over `account_url`. Treat this value as a secret. |
+| `ca_bundle` | no | `""` | Path to a custom TLS CA bundle. |
+
+For example, add this entry to `secondary_tiers`:
+
+```json
+{
+  "type": "obj",
+  "backend": "AZURE_BLOB",
+  "store_config": {
+    "account_url": "https://<account>.blob.core.windows.net",
+    "container_name": "kv-cache"
+  },
+  "prefix": "vllm"
+}
+```
+
+Without a connection string, the backend uses the Azure SDK default credential
+chain, including managed identity and environment credentials. For plugin build
+and authentication details, see the [NIXL Azure Blob documentation](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/azure_blob/README.md).
 
 ### P2P (Including P/D)
 

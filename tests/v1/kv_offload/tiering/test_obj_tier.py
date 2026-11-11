@@ -3,7 +3,7 @@
 """Mock-based unit tests for ObjectStoreSecondaryTierManager.
 
 These tests replace the NIXL backend with an in-memory mock so they run
-without S3 credentials or a live object store. They verify the manager's
+without storage credentials or a live object store. They verify the manager's
 state machine: job submission, transfer completion polling, and lookup.
 """
 
@@ -38,7 +38,10 @@ from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
-from vllm.v1.kv_offload.tiering.obj.config import ObjStoreConfig
+from vllm.v1.kv_offload.tiering.obj.config import (
+    AzureBlobStoreConfig,
+    ObjStoreConfig,
+)
 from vllm.v1.kv_offload.tiering.obj.manager import ObjectStoreSecondaryTierManager
 
 # ---------------------------------------------------------------------------
@@ -95,6 +98,10 @@ _STORE_CONFIG = {
     "access_key": "mock-access",
     "secret_key": "mock-secret",
 }
+_AZURE_STORE_CONFIG = {
+    "container_name": "kv-cache",
+    "account_url": "https://example.blob.core.windows.net",
+}
 
 _BLOCK_ELEMENTS = 256
 _DTYPE = torch.float32
@@ -145,6 +152,7 @@ class MockNixlAgent:
 
     def __init__(self, agent_name, config):
         self._capture_telemetry = config.capture_telemetry
+        self.backends: dict[str, dict[str, str]] = {}
         self._stored_obj_keys: set[str] = set()
         # handle_id -> (op, [obj_keys])
         self._pending: dict[int, tuple[str, list[str]]] = {}
@@ -157,7 +165,7 @@ class MockNixlAgent:
         self.query_memory = self._query_memory
 
     def create_backend(self, backend_type, params):
-        pass
+        self.backends[backend_type] = params
 
     def _register_memory(self, descs, mem_type=None, backends=None):
         mock = MagicMock()
@@ -212,7 +220,9 @@ class MockNixlAgent:
             raise RuntimeError("Telemetry capture is disabled")
         return SimpleNamespace(xferDuration=1000)
 
-    def _query_memory(self, queries, mem_type, agent_name):
+    def _query_memory(self, queries, backend, mem_type):
+        assert backend in self.backends
+        assert mem_type == "OBJ"
         return [object() if q[3] in self._stored_obj_keys else None for q in queries]
 
 
@@ -237,6 +247,7 @@ def _make_tier(
     num_blocks: int = 4,
     offloading_spec: SimpleNamespace = _OFFLOADING_SPEC,
     primary_kv_view: memoryview | None = None,
+    store_config: dict | None = None,
     **tier_kwargs,
 ) -> tuple[ObjectStoreSecondaryTierManager, MockNixlAgent]:
     """Create a tier backed by a fresh MockNixlAgent."""
@@ -259,11 +270,29 @@ def _make_tier(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,
             tier_type="obj",
-            store_config=_STORE_CONFIG,
+            store_config=_STORE_CONFIG if store_config is None else store_config,
             prefix=_RUN_PREFIX,
             **tier_kwargs,
         )
     return tier, tier._agent
+
+
+@pytest.fixture(params=["OBJ", "AZURE_BLOB"])
+def make_tier(request):
+    backend = request.param
+    store_config = _STORE_CONFIG if backend == "OBJ" else _AZURE_STORE_CONFIG
+    tiers = []
+
+    def create_tier(**kwargs):
+        tier, agent = _make_tier(
+            **{**kwargs, "backend": backend, "store_config": store_config}
+        )
+        tiers.append(tier)
+        return tier, agent
+
+    yield create_tier
+    for tier in reversed(tiers):
+        tier.shutdown()
 
 
 def drain(
@@ -302,14 +331,15 @@ def lookup_and_wait(
 
 
 @pytest.mark.parametrize("locality", ["local", ""])
-def test_invalid_locality_raises_at_construction(locality):
+def test_invalid_locality_raises_at_construction(locality, make_tier):
     with pytest.raises(ValueError, match="Locality"):
-        _make_tier(locality=locality)
+        make_tier(locality=locality)
 
 
 class TestMockObjTierBasic:
-    def setup_method(self):
-        self.tier, self.agent = _make_tier(num_blocks=4)
+    @pytest.fixture(autouse=True)
+    def setup_tier(self, make_tier):
+        self.tier, self.agent = make_tier(num_blocks=4)
 
     def test_lookup_empty_tier(self):
         assert lookup_and_wait(self.tier, [key(1)]) == [LookupResult.MISS]
@@ -424,8 +454,8 @@ class TestMockObjTierBasic:
 
 
 class TestMockObjTierMultiBlock:
-    def test_store_multiple_blocks(self):
-        tier, _ = _make_tier(num_blocks=8)
+    def test_store_multiple_blocks(self, make_tier):
+        tier, _ = make_tier(num_blocks=8)
         keys = [key(i) for i in range(8)]
         tier.submit_store(make_job(1, keys, list(range(8))))
         results = drain(tier)
@@ -433,8 +463,8 @@ class TestMockObjTierMultiBlock:
         assert results[0].success
         assert lookup_and_wait(tier, keys) == [LookupResult.HIT] * 8
 
-    def test_partial_block_lookup(self):
-        tier, _ = _make_tier(num_blocks=4)
+    def test_partial_block_lookup(self, make_tier):
+        tier, _ = make_tier(num_blocks=4)
         tier.submit_store(make_job(1, [key(0), key(1)], [0, 1]))
         drain(tier)
         assert lookup_and_wait(tier, [key(0), key(1), key(2)]) == [
@@ -445,15 +475,17 @@ class TestMockObjTierMultiBlock:
 
 
 class TestMockObjTierFailures:
-    def test_lookup_exception_returns_false(self):
-        tier, agent = _make_tier(num_blocks=4)
+    def test_lookup_exception_returns_false(self, make_tier):
+        tier, agent = make_tier(num_blocks=4)
         agent.query_memory = lambda *a, **k: (_ for _ in ()).throw(
             RuntimeError("backend error")
         )
         assert lookup_and_wait(tier, [key(1)]) == [LookupResult.MISS]
 
-    def test_submit_store_register_memory_failure_reported_in_get_finished(self):
-        tier, agent = _make_tier(num_blocks=4)
+    def test_submit_store_register_memory_failure_reported_in_get_finished(
+        self, make_tier
+    ):
+        tier, agent = make_tier(num_blocks=4)
         agent.register_memory = lambda *a, **k: None
         tier.submit_store(make_job(1, [key(1)], [0]))
         results = list(tier.get_finished_jobs())
@@ -461,8 +493,10 @@ class TestMockObjTierFailures:
         assert results[0].job_id == 1
         assert not results[0].success
 
-    def test_submit_load_register_memory_failure_reported_in_get_finished(self):
-        tier, agent = _make_tier(num_blocks=4)
+    def test_submit_load_register_memory_failure_reported_in_get_finished(
+        self, make_tier
+    ):
+        tier, agent = make_tier(num_blocks=4)
         agent.register_memory = lambda *a, **k: None
         tier.submit_load(make_job(2, [key(1)], [0]))
         results = list(tier.get_finished_jobs())
@@ -470,8 +504,10 @@ class TestMockObjTierFailures:
         assert results[0].job_id == 2
         assert not results[0].success
 
-    def test_submit_store_make_prepped_xfer_failure_reported_in_get_finished(self):
-        tier, agent = _make_tier(num_blocks=4)
+    def test_submit_store_make_prepped_xfer_failure_reported_in_get_finished(
+        self, make_tier
+    ):
+        tier, agent = make_tier(num_blocks=4)
         agent.make_prepped_xfer = lambda *a, **k: None
         tier.submit_store(make_job(3, [key(1)], [0]))
         results = list(tier.get_finished_jobs())
@@ -479,9 +515,9 @@ class TestMockObjTierFailures:
         assert results[0].job_id == 3
         assert not results[0].success
 
-    def test_failure_and_success_both_returned_by_get_finished(self):
+    def test_failure_and_success_both_returned_by_get_finished(self, make_tier):
         # One job fails at submission, another succeeds in flight.
-        tier, agent = _make_tier(num_blocks=4)
+        tier, agent = make_tier(num_blocks=4)
         original_register = agent.register_memory
         call_count = [0]
 
@@ -499,8 +535,10 @@ class TestMockObjTierFailures:
         assert not by_id[1].success
         assert by_id[2].success
 
-    def test_release_xfer_failure_retries_without_losing_result(self, monkeypatch):
-        tier, agent = _make_tier(num_blocks=4)
+    def test_release_xfer_failure_retries_without_losing_result(
+        self, monkeypatch, make_tier
+    ):
+        tier, agent = make_tier(num_blocks=4)
         agent.check_xfer_state = MagicMock(side_effect=RuntimeError("poll failed"))
         release_xfer = MagicMock(
             side_effect=[RuntimeError("transfer is still active"), None]
@@ -529,9 +567,9 @@ class TestMockObjTierFailures:
         "cleanup_method", ["release_dlist_handle", "deregister_memory"]
     )
     def test_post_transfer_cleanup_failure_does_not_lose_result(
-        self, monkeypatch, cleanup_method
+        self, monkeypatch, cleanup_method, make_tier
     ):
-        tier, agent = _make_tier(num_blocks=4)
+        tier, agent = make_tier(num_blocks=4)
         monkeypatch.setattr(
             agent,
             cleanup_method,
@@ -547,7 +585,9 @@ class TestMockObjTierFailures:
         assert not tier._transfers
         assert list(tier.get_finished_jobs()) == []
 
-    def test_xfer_cleanup_retry_finalizes_parent_job_and_primary_pin(self, monkeypatch):
+    def test_xfer_cleanup_retry_finalizes_parent_job_and_primary_pin(
+        self, monkeypatch, make_tier
+    ):
         num_blocks = 4
         tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         primary_kv_view = memoryview(tensor.numpy())
@@ -556,7 +596,7 @@ class TestMockObjTierFailures:
         primary_tier = CPUPrimaryTierOffloadingManager(
             num_chunks=num_blocks, mmap_region=mmap_region
         )
-        obj_tier, agent = _make_tier(
+        obj_tier, agent = make_tier(
             num_blocks=num_blocks, primary_kv_view=primary_kv_view
         )
         manager = TieringOffloadingManager(
@@ -600,8 +640,8 @@ class TestMockObjTierFailures:
 
 
 class TestMockObjTierShutdown:
-    def test_shutdown_clears_in_flight_transfers(self):
-        tier, agent = _make_tier(num_blocks=4)
+    def test_shutdown_clears_in_flight_transfers(self, make_tier):
+        tier, agent = make_tier(num_blocks=4)
         # Keep transfer in flight by never completing it
         agent.check_xfer_state = lambda h: "PROC"
         tier.submit_store(make_job(1, [key(1)], [0]))
@@ -611,15 +651,16 @@ class TestMockObjTierShutdown:
         assert tier._dram_prepped_handle is None
         assert tier._primary_reg is None
 
-    def test_shutdown_idempotent(self):
-        tier, _ = _make_tier(num_blocks=4)
+    def test_shutdown_idempotent(self, make_tier):
+        tier, _ = make_tier(num_blocks=4)
         tier.shutdown()
         tier.shutdown()  # must not raise
 
 
 class TestObjTierKVEvents:
-    def setup_method(self):
-        self.tier, self.agent = _make_tier(
+    @pytest.fixture(autouse=True)
+    def setup_tier(self, make_tier):
+        self.tier, self.agent = make_tier(
             offloading_spec=_make_events_spec(enable_kv_cache_events=True),
             enable_kv_events=True,
             locality="REMOTE",
@@ -644,9 +685,9 @@ class TestObjTierKVEvents:
         ("locality", "expected"),
         [(None, None), ("LOCAL", Locality.LOCAL)],
     )
-    def test_store_event_uses_configured_locality(self, locality, expected):
+    def test_store_event_uses_configured_locality(self, locality, expected, make_tier):
         locality_config = {} if locality is None else {"locality": locality}
-        tier, _ = _make_tier(
+        tier, _ = make_tier(
             offloading_spec=_make_events_spec(enable_kv_cache_events=True),
             enable_kv_events=True,
             **locality_config,
@@ -708,8 +749,8 @@ class TestObjTierKVEvents:
         assert list(self.tier.take_events()) == []
         assert self.tier._store_job_keys == {}
 
-    def test_events_disabled_by_default(self):
-        tier, _ = _make_tier()
+    def test_events_disabled_by_default(self, make_tier):
+        tier, _ = make_tier()
         tier.submit_store(make_job(1, [key(1)], [0]))
         results = drain(tier)
         assert len(results) == 1
@@ -718,9 +759,9 @@ class TestObjTierKVEvents:
         assert tier._store_job_keys == {}
         assert list(tier.take_events()) == []
 
-    def test_events_require_global_kv_events_flag(self):
+    def test_events_require_global_kv_events_flag(self, make_tier):
         """Tier-level opt-in alone is not enough; the global flag gates events."""
-        tier, _ = _make_tier(
+        tier, _ = make_tier(
             offloading_spec=_make_events_spec(enable_kv_cache_events=False),
             enable_kv_events=True,
         )
@@ -779,7 +820,88 @@ class TestObjStoreConfig:
         assert "access_key" not in params
 
 
-def test_obj_tier_replicated_layout_collapses_mapper_identity():
+@pytest.mark.parametrize(
+    "store_config",
+    [
+        {
+            "container_name": "kv-cache",
+            "account_url": "https://example.blob.core.windows.net",
+        },
+        {
+            "container_name": "kv-cache",
+            "connection_string": "test-connection-string",
+        },
+        {
+            "container_name": "kv-cache",
+            "account_url": "https://example.blob.core.windows.net",
+            "ca_bundle": "/path/to/ca.pem",
+        },
+    ],
+)
+def test_azure_config_preserves_provider_parameters_and_hides_credentials(store_config):
+    config = AzureBlobStoreConfig(**store_config)
+    assert config.to_nixl_params() == store_config
+    assert "test-connection-string" not in repr(config)
+
+
+@pytest.mark.parametrize(
+    "store_config",
+    [
+        {"container_name": ""},
+        {"container_name": "kv-cache"},
+    ],
+)
+def test_azure_config_rejects_missing_storage_location(store_config):
+    with pytest.raises(ValueError, match="Azure Blob store_config requires"):
+        AzureBlobStoreConfig(**store_config)
+
+
+def test_obj_tier_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="Unsupported object store backend"):
+        _make_tier(backend="UNKNOWN")
+
+
+def test_obj_tier_defaults_to_obj_backend():
+    tier, agent = _make_tier()
+    try:
+        assert set(agent.backends) == {"OBJ"}
+    finally:
+        tier.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("backend", "store_config", "message"),
+    [
+        ("OBJ", _STORE_CONFIG, "check bucket, endpoint_override, and scheme"),
+        ("AZURE_BLOB", _AZURE_STORE_CONFIG, "check container_name"),
+    ],
+)
+def test_connectivity_probe_failure_reports_backend_config(
+    backend, store_config, message
+):
+    with (
+        patch.object(MockNixlAgent, "_query_memory", side_effect=RuntimeError("error")),
+        pytest.raises(RuntimeError, match=message),
+    ):
+        _make_tier(backend=backend, store_config=store_config)
+
+
+@pytest.mark.parametrize(
+    ("backend", "store_config", "expected_params"),
+    [
+        ("OBJ", _STORE_CONFIG, {**_STORE_CONFIG, "scheme": "http"}),
+        ("AZURE_BLOB", _AZURE_STORE_CONFIG, _AZURE_STORE_CONFIG),
+    ],
+)
+def test_obj_tier_creates_selected_backend(backend, store_config, expected_params):
+    tier, agent = _make_tier(backend=backend, store_config=store_config, io_threads=2)
+    try:
+        assert agent.backends == {backend: {**expected_params, "num_threads": "2"}}
+    finally:
+        tier.shutdown()
+
+
+def test_obj_tier_replicated_layout_collapses_mapper_identity(make_tier):
     """TP=2 and TP=4 replicated configs share the obj FileMapper namespace."""
     tp2_spec = SimpleNamespace(
         config=_make_offloading_config(
@@ -801,8 +923,8 @@ def test_obj_tier_replicated_layout_collapses_mapper_identity():
             self_describing_kv_events=False,
         ),
     )
-    tp2_tier, _ = _make_tier(offloading_spec=tp2_spec)
-    tp4_tier, _ = _make_tier(offloading_spec=tp4_spec)
+    tp2_tier, _ = make_tier(offloading_spec=tp2_spec)
+    tp4_tier, _ = make_tier(offloading_spec=tp4_spec)
     try:
         assert tp2_tier._file_mapper.base_path == tp4_tier._file_mapper.base_path
         assert tp2_tier._file_mapper.rank == 0
@@ -815,7 +937,7 @@ def test_obj_tier_replicated_layout_collapses_mapper_identity():
         tp4_tier.shutdown()
 
 
-def test_obj_tier_namespace_includes_blocks_per_chunk():
+def test_obj_tier_namespace_includes_blocks_per_chunk(make_tier):
     """Chunks of different sizes have different layouts, so they must not share
     object keys (the fs tier namespaces by chunk size the same way)."""
     tiers = []
@@ -824,7 +946,7 @@ def test_obj_tier_namespace_includes_blocks_per_chunk():
             config=_make_offloading_config(False, blocks_per_chunk=blocks_per_chunk),
             blocks_per_chunk=blocks_per_chunk,
         )
-        tiers.append(_make_tier(offloading_spec=spec)[0])
+        tiers.append(make_tier(offloading_spec=spec)[0])
     try:
         assert tiers[0]._file_mapper.get_file_name(key(1)) != (
             tiers[1]._file_mapper.get_file_name(key(1))

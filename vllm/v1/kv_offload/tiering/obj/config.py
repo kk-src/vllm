@@ -44,3 +44,34 @@ class ObjStoreConfig:
             if value:
                 params[key] = value
         return params
+
+
+@dataclass
+class AzureBlobStoreConfig:
+    """Connection parameters for the NIXL Azure Blob backend.
+
+    When ``connection_string`` is empty, the NIXL AZURE_BLOB plugin uses
+    ``account_url`` with the Azure default credential chain.
+    """
+
+    container_name: str
+    account_url: str = ""
+    connection_string: str = field(default="", repr=False)
+    ca_bundle: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.container_name:
+            raise ValueError("Azure Blob store_config requires container_name")
+        if not self.account_url and not self.connection_string:
+            raise ValueError(
+                "Azure Blob store_config requires account_url or connection_string"
+            )
+
+    def to_nixl_params(self) -> dict[str, str]:
+        """Build the NIXL backend params dict, omitting empty optional fields."""
+        params: dict[str, str] = {"container_name": self.container_name}
+        for key in ("account_url", "connection_string", "ca_bundle"):
+            value = getattr(self, key)
+            if value:
+                params[key] = value
+        return params
